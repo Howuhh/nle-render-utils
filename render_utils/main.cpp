@@ -183,7 +183,7 @@ void tile_crop(py::array_t<uint8_t> tty_chars, py::array_t<int8_t> tty_colors,
                 if (full_tty_mode && is_cursor_cell) {
                   // Red overlay color: RGB = (255, 0, 0)
                   // Alpha ~= 0.35 so the underlying map/underline remains visible
-                  constexpr int alpha_num = 35;
+                  constexpr int alpha_num = 50;
                   constexpr int alpha_den = 100;
 
                   int overlay = 0;
