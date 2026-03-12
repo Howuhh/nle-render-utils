@@ -52,7 +52,7 @@ void check_array_shapes(py::handle tty_chars, py::handle tty_colors,
 
   const auto &cursor_shape = py::array::ensure(tty_cursor).request().shape;
   if (!(cursor_shape[cursor_shape.size() - 1] == 2))
-    throw std::invalid_argument("Shape of glyph_images must be (2)");
+    throw std::invalid_argument("Shape of tty_cursor must be (2)");
 
   if (!(chars_shape.size() - 2 == cursor_shape.size() - 1 &&
         chars_shape.size() - 2 == out_shape.size() - 3)) {
@@ -124,10 +124,11 @@ void tile_crop(py::array_t<uint8_t> tty_chars, py::array_t<int8_t> tty_colors,
   int s_out_frame = out_chan * out_rows * out_cols;
   int s_out_chan = out_rows * out_cols;
   int s_out_row = out_cols;
+
   {
     py::gil_scoped_release release;
 
-    for (size_t i = 0; i < lead_elems; ++i) {
+    for (size_t frame = 0; frame < lead_elems; ++frame) {
       auto chars_at = [char_ptr, s_char_row](int h, int w) {
         return *(char_ptr + h * s_char_row + w);
       };
@@ -143,32 +144,77 @@ void tile_crop(py::array_t<uint8_t> tty_chars, py::array_t<int8_t> tty_colors,
         return (out_ptr + chan * s_out_chan + h * s_out_row + w);
       };
 
-      int start_h = (crop_size > 0) ? cur_ptr[0] - half_crop_size : 0;
-      int start_w = (crop_size > 0) ? cur_ptr[1] - half_crop_size : 0;
+      const int cursor_h = cur_ptr[0];
+      const int cursor_w = cur_ptr[1];
+      const bool full_tty_mode = (crop_size < 0);
+
+      int start_h = (crop_size > 0) ? cursor_h - half_crop_size : 0;
+      int start_w = (crop_size > 0) ? cursor_w - half_crop_size : 0;
 
       int max_r = (crop_size > 0) ? crop_size : rows;
       int max_c = (crop_size > 0) ? crop_size : cols;
+
       for (size_t r = 0; r < max_r; ++r) {
         int h = r + start_h;
         for (size_t c = 0; c < max_c; ++c) {
           int w = c + start_w;
+
+          const bool is_cursor_cell = (h == cursor_h && w == cursor_w);
+
           for (size_t i_chan = 0; i_chan < img_channels; ++i_chan) {
             for (size_t i_r = 0; i_r < img_rows; ++i_r) {
               for (size_t i_c = 0; i_c < img_cols; ++i_c) {
 
-                if ((h < 0 || h >= rows || w < 0 || w >= cols)) {
-                  *out_ptr_(i_chan, r * img_rows + i_r, c * img_cols + i_c) = 0;
-                } else {
-                  int this_glyph = chars_at(h, w);
-                  int this_color = colors_at(h, w);
-                  *out_ptr_(i_chan, r * img_rows + i_r, c * img_cols + i_c) =
-                      img_at(this_glyph, this_color, i_chan, i_r, i_c);
+                uint8_t *dst = out_ptr_(i_chan, r * img_rows + i_r, c * img_cols + i_c);
+
+                if (h < 0 || h >= rows || w < 0 || w >= cols) {
+                  *dst = 0;
+                  continue;
                 }
+
+                int this_glyph = chars_at(h, w);
+                int this_color = colors_at(h, w);
+                uint8_t base = img_at(this_glyph, this_color, i_chan, i_r, i_c);
+
+                // Default: normal glyph render
+                uint8_t value = base;
+
+                // In full-tty mode, overlay translucent red cursor on the cursor tile
+                if (full_tty_mode && is_cursor_cell) {
+                  // Red overlay color: RGB = (255, 0, 0)
+                  // Alpha ~= 0.35 so the underlying map/underline remains visible
+                  constexpr int alpha_num = 35;
+                  constexpr int alpha_den = 100;
+
+                  int overlay = 0;
+                  if (img_channels >= 3) {
+                    if (i_chan == 0) {
+                      overlay = 255; // R
+                    } else if (i_chan == 1) {
+                      overlay = 0;   // G
+                    } else if (i_chan == 2) {
+                      overlay = 0;   // B
+                    } else {
+                      overlay = base; // leave extra channels unchanged
+                    }
+                  } else if (img_channels == 1) {
+                    // Grayscale fallback: brighten cursor cell
+                    overlay = 255;
+                  } else {
+                    overlay = base;
+                  }
+
+                  value = static_cast<uint8_t>(
+                      (base * (alpha_den - alpha_num) + overlay * alpha_num) / alpha_den);
+                }
+
+                *dst = value;
               }
             }
           }
         }
       }
+
       char_ptr += s_char_frame;
       color_ptr += s_color_frame;
       cur_ptr += s_cursor_frame;
@@ -176,6 +222,117 @@ void tile_crop(py::array_t<uint8_t> tty_chars, py::array_t<int8_t> tty_colors,
     }
   }
 }
+
+// void tile_crop(py::array_t<uint8_t> tty_chars, py::array_t<int8_t> tty_colors,
+//                py::array_t<uint8_t> tty_cursor, py::array_t<uint8_t> images,
+//                py::array_t<uint8_t> out_array, int crop_size) {
+
+//   py::buffer_info chars_buff = tty_chars.request();
+//   py::buffer_info colors_buff = tty_colors.request();
+//   py::buffer_info cursor_buff = tty_cursor.request();
+//   py::buffer_info images_buff = images.request();
+//   py::buffer_info out_buff = out_array.request();
+
+//   const auto &chars_shape = chars_buff.shape;
+//   const auto &img_shape = images_buff.shape;
+//   const auto &out_shape = out_buff.shape;
+
+//   int lead_dims = chars_shape.size() - 2;
+//   int lead_elems = 1;
+//   for (int i = 0; i < lead_dims; ++i) {
+//     lead_elems *= chars_shape[i];
+//   }
+
+//   int rows = chars_shape[lead_dims + 0];
+//   int cols = chars_shape[lead_dims + 1];
+
+//   int img_colors = img_shape[1];
+//   int img_channels = img_shape[2];
+//   int img_rows = img_shape[3];
+//   int img_cols = img_shape[4];
+
+//   int out_chan = out_shape[lead_dims + 0];
+//   int out_rows = out_shape[lead_dims + 1];
+//   int out_cols = out_shape[lead_dims + 2];
+
+//   uint8_t *char_ptr = static_cast<uint8_t *>(chars_buff.ptr);
+//   int8_t *color_ptr = static_cast<int8_t *>(colors_buff.ptr);
+//   uint8_t *out_ptr = static_cast<uint8_t *>(out_buff.ptr);
+//   uint8_t *cur_ptr = static_cast<uint8_t *>(cursor_buff.ptr);
+//   uint8_t *img_ptr = static_cast<uint8_t *>(images_buff.ptr);
+
+//   int half_crop_size = crop_size / 2;
+
+//   // Strides
+//   int s_char_frame = rows * cols;
+//   int s_char_row = cols;
+
+//   int s_color_frame = rows * cols;
+//   int s_color_row = cols;
+
+//   int s_cursor_frame = 2;
+
+//   int s_img_col = img_cols;
+//   int s_img_row = img_rows * img_cols;
+//   int s_img_color = img_channels * img_rows * img_cols;
+//   int s_img_glyph = img_colors * img_channels * img_rows * img_cols;
+
+//   int s_out_frame = out_chan * out_rows * out_cols;
+//   int s_out_chan = out_rows * out_cols;
+//   int s_out_row = out_cols;
+//   {
+//     py::gil_scoped_release release;
+
+//     for (size_t i = 0; i < lead_elems; ++i) {
+//       auto chars_at = [char_ptr, s_char_row](int h, int w) {
+//         return *(char_ptr + h * s_char_row + w);
+//       };
+//       auto colors_at = [color_ptr, s_color_row](int h, int w) {
+//         return *(color_ptr + h * s_color_row + w);
+//       };
+//       auto img_at = [img_ptr, s_img_glyph, s_img_color, s_img_row,
+//                      s_img_col](int glyph, int color, int chan, int h, int w) {
+//         return *(img_ptr + glyph * s_img_glyph + color * s_img_color +
+//                  chan * s_img_row + h * s_img_col + w);
+//       };
+//       auto out_ptr_ = [out_ptr, s_out_chan, s_out_row](int chan, int h, int w) {
+//         return (out_ptr + chan * s_out_chan + h * s_out_row + w);
+//       };
+
+//       int start_h = (crop_size > 0) ? cur_ptr[0] - half_crop_size : 0;
+//       int start_w = (crop_size > 0) ? cur_ptr[1] - half_crop_size : 0;
+
+//       int max_r = (crop_size > 0) ? crop_size : rows;
+//       int max_c = (crop_size > 0) ? crop_size : cols;
+//       for (size_t r = 0; r < max_r; ++r) {
+//         int h = r + start_h;
+//         for (size_t c = 0; c < max_c; ++c) {
+//           int w = c + start_w;
+//           for (size_t i_chan = 0; i_chan < img_channels; ++i_chan) {
+//             for (size_t i_r = 0; i_r < img_rows; ++i_r) {
+//               for (size_t i_c = 0; i_c < img_cols; ++i_c) {
+
+//                 if ((h < 0 || h >= rows || w < 0 || w >= cols)) {
+//                   *out_ptr_(i_chan, r * img_rows + i_r, c * img_cols + i_c) = 0;
+//                 } else {
+//                   int this_glyph = chars_at(h, w);
+//                   int this_color = colors_at(h, w);
+//                   *out_ptr_(i_chan, r * img_rows + i_r, c * img_cols + i_c) =
+//                       img_at(this_glyph, this_color, i_chan, i_r, i_c);
+//                 }
+//               }
+//             }
+//           }
+//         }
+//       }
+//       char_ptr += s_char_frame;
+//       color_ptr += s_color_frame;
+//       cur_ptr += s_cursor_frame;
+//       out_ptr += s_out_frame;
+//     }
+//   }
+// }
+
 void render_crop(py::object tty_chars, py::object tty_colors,
                  py::object tty_cursor, py::object images, py::object out_array,
                  int crop_size) {
